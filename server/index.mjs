@@ -184,7 +184,7 @@ async function exportDataset(datasetId, exportId, jobId, mappings) {
 
 async function handleApi(request, response, url) {
   const parts = url.pathname.split('/').filter(Boolean);
-  const sessionId = sessionFor(request);
+  const sessionId = url.searchParams.get('sessionId') || sessionFor(request);
   if (request.method === 'GET' && url.pathname === '/api/health') return json(response, 200, { ok: true });
   if (request.method === 'POST' && url.pathname === '/api/session/close') {
     await purgeSession(sessionId);

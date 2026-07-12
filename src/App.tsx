@@ -17,7 +17,7 @@ const resumableKey = (file: File) => `trie-upload:${file.name}:${file.size}:${fi
 const pageSessionId = crypto.randomUUID();
 
 window.addEventListener('pagehide', () => {
-  void navigator.sendBeacon('/api/session/close', new Blob([], { type: 'application/octet-stream' }));
+  void navigator.sendBeacon(`/api/session/close?sessionId=${encodeURIComponent(pageSessionId)}`, new Blob([], { type: 'application/octet-stream' }));
 });
 
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
