@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream, existsSync } from 'node:fs';
-import { access, rm, stat, writeFile } from 'node:fs/promises';
+import { access, readdir, rm, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,6 +13,7 @@ const port = Number(process.env.PORT || 8787);
 const chunkSize = 5 * 1024 * 1024;
 const maxUploadSize = 512 * 1024 * 1024;
 const activeJobs = new Set();
+const sessionTtlMs = Number(process.env.SESSION_TTL_MS || 60 * 60 * 1000);
 const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const distRoot = path.join(appRoot, 'dist');
 
@@ -59,8 +60,18 @@ async function uploadResponse(upload) {
   return { upload: { ...upload, received, totalChunks } };
 }
 
-async function listDatasets() {
+function sessionFor(request) {
+  const value = String(request.headers['x-session-id'] || 'anonymous');
+  return /^[a-zA-Z0-9_-]{8,100}$/.test(value) ? value : 'anonymous';
+}
+
+function belongsToSession(item, sessionId) {
+  return item.sessionId === sessionId;
+}
+
+async function listDatasets(sessionId) {
   return (await listEntities('datasets'))
+    .filter((dataset) => belongsToSession(dataset, sessionId))
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
     .map(({ filePath, ...dataset }) => dataset);
 }
@@ -71,6 +82,7 @@ async function joinParts(upload) {
   const totalChunks = Math.ceil(upload.size / upload.chunkSize);
   for (let index = 0; index < totalChunks; index++) {
     await pipeline(createReadStream(uploadPartPath(upload.id, index)), createWriteStream(finalPath, { flags: 'a' }));
+    await rm(uploadPartPath(upload.id, index), { force: true });
   }
   return finalPath;
 }
@@ -172,8 +184,13 @@ async function exportDataset(datasetId, exportId, jobId, mappings) {
 
 async function handleApi(request, response, url) {
   const parts = url.pathname.split('/').filter(Boolean);
+  const sessionId = sessionFor(request);
   if (request.method === 'GET' && url.pathname === '/api/health') return json(response, 200, { ok: true });
-  if (request.method === 'GET' && url.pathname === '/api/datasets') return json(response, 200, { datasets: await listDatasets() });
+  if (request.method === 'POST' && url.pathname === '/api/session/close') {
+    await purgeSession(sessionId);
+    return json(response, 200, { ok: true });
+  }
+  if (request.method === 'GET' && url.pathname === '/api/datasets') return json(response, 200, { datasets: await listDatasets(sessionId) });
 
   if (request.method === 'POST' && url.pathname === '/api/uploads/init') {
     const body = await readJson(request);
@@ -181,16 +198,16 @@ async function handleApi(request, response, url) {
     const size = Number(body.size || 0);
     const fingerprint = String(body.fingerprint || '');
     if (!name.toLowerCase().endsWith('.csv') || !size || size > maxUploadSize) return json(response, 400, { error: '请上传小于 512MB 的 CSV 文件' });
-    const existing = (await listEntities('uploads')).find((item) => item.fingerprint === fingerprint && item.size === size && item.status !== 'completed');
+    const existing = (await listEntities('uploads')).find((item) => belongsToSession(item, sessionId) && item.fingerprint === fingerprint && item.size === size && item.status !== 'completed');
     if (existing) return json(response, 200, await uploadResponse(existing));
-    const upload = { id: id(), name, size, fingerprint, chunkSize, status: 'uploading', createdAt: now(), updatedAt: now() };
+    const upload = { id: id(), sessionId, name, size, fingerprint, chunkSize, status: 'uploading', createdAt: now(), updatedAt: now() };
     await writeEntity('uploads', upload.id, upload);
     return json(response, 201, await uploadResponse(upload));
   }
 
   if (parts[0] === 'api' && parts[1] === 'uploads' && parts[2]) {
     const upload = await readEntity('uploads', parts[2]);
-    if (!upload) return notFound(response);
+    if (!upload || !belongsToSession(upload, sessionId)) return notFound(response);
     if (request.method === 'GET' && parts.length === 3) return json(response, 200, await uploadResponse(upload));
     if (request.method === 'PUT' && parts[3] === 'chunks' && parts[4] !== undefined) {
       const index = Number(parts[4]);
@@ -209,7 +226,7 @@ async function handleApi(request, response, url) {
       if (upload.datasetId) return json(response, 200, { datasetId: upload.datasetId });
       const filePath = await joinParts(upload);
       const columns = await inspectCsv(filePath);
-      const dataset = { id: id(), uploadId: upload.id, name: upload.name, filePath, size: upload.size, columns, selectedColumns: [], status: 'needs_columns', createdAt: now(), updatedAt: now() };
+      const dataset = { id: id(), sessionId, uploadId: upload.id, name: upload.name, filePath, size: upload.size, columns, selectedColumns: [], status: 'needs_columns', createdAt: now(), updatedAt: now() };
       await writeEntity('datasets', dataset.id, dataset);
       await writeEntity('uploads', upload.id, { ...upload, status: 'completed', datasetId: dataset.id, updatedAt: now() });
       return json(response, 201, { datasetId: dataset.id });
@@ -218,13 +235,13 @@ async function handleApi(request, response, url) {
 
   if (parts[0] === 'api' && parts[1] === 'datasets' && parts[2]) {
     const dataset = await readEntity('datasets', parts[2]);
-    if (!dataset) return notFound(response);
+    if (!dataset || !belongsToSession(dataset, sessionId)) return notFound(response);
     if (request.method === 'GET' && parts.length === 3) return json(response, 200, { dataset: { ...dataset, filePath: undefined } });
     if (request.method === 'POST' && parts[3] === 'process') {
       const body = await readJson(request);
       const selectedColumns = [...new Set((body.selectedColumns || []).map(Number).filter((index) => Number.isInteger(index) && index >= 0 && index < dataset.columns.length))];
       if (!selectedColumns.length) return json(response, 400, { error: '至少选择一个路径列' });
-      const job = { id: id(), type: 'build_tree', datasetId: dataset.id, status: 'queued', progress: { processedRows: 0, pathCount: 0 }, createdAt: now(), updatedAt: now() };
+      const job = { id: id(), sessionId, type: 'build_tree', datasetId: dataset.id, status: 'queued', progress: { processedRows: 0, pathCount: 0 }, createdAt: now(), updatedAt: now() };
       await writeEntity('jobs', job.id, job);
       await writeEntity('datasets', dataset.id, { ...dataset, selectedColumns, status: 'queued', jobId: job.id, updatedAt: now() });
       void processDataset(dataset.id, job.id);
@@ -241,8 +258,8 @@ async function handleApi(request, response, url) {
       const mappings = (body.mappings || []).map((mapping) => ({ source: String(mapping.source || '').trim(), destination: normalizeTarget(mapping.destination) }))
         .filter((mapping) => mapping.source && mapping.destination);
       if (!mappings.length) return json(response, 400, { error: '请先选择来源前缀并填写目的地' });
-      const exportItem = { id: id(), datasetId: dataset.id, name: `${dataset.name.replace(/\.csv$/i, '')}-transfer.csv`, status: 'queued', createdAt: now() };
-      const job = { id: id(), type: 'export_csv', datasetId: dataset.id, exportId: exportItem.id, status: 'queued', progress: { processedRows: 0, rows: 0 }, createdAt: now(), updatedAt: now() };
+      const exportItem = { id: id(), sessionId, datasetId: dataset.id, name: `${dataset.name.replace(/\.csv$/i, '')}-transfer.csv`, status: 'queued', createdAt: now() };
+      const job = { id: id(), sessionId, type: 'export_csv', datasetId: dataset.id, exportId: exportItem.id, status: 'queued', progress: { processedRows: 0, rows: 0 }, createdAt: now(), updatedAt: now() };
       await writeEntity('exports', exportItem.id, exportItem);
       await writeEntity('jobs', job.id, job);
       void exportDataset(dataset.id, exportItem.id, job.id, mappings);
@@ -252,11 +269,11 @@ async function handleApi(request, response, url) {
 
   if (parts[0] === 'api' && parts[1] === 'jobs' && parts[2] && request.method === 'GET') {
     const job = await readEntity('jobs', parts[2]);
-    return job ? json(response, 200, { job }) : notFound(response);
+    return job && belongsToSession(job, sessionId) ? json(response, 200, { job }) : notFound(response);
   }
   if (parts[0] === 'api' && parts[1] === 'exports' && parts[2]) {
     const exportItem = await readEntity('exports', parts[2]);
-    if (!exportItem) return notFound(response);
+    if (!exportItem || !belongsToSession(exportItem, sessionId)) return notFound(response);
     if (request.method === 'GET' && parts[3] === 'download') {
       if (exportItem.status !== 'ready') return json(response, 409, { error: '导出文件尚未准备完成' });
       response.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="${encodeURIComponent(exportItem.name)}"` });
@@ -265,6 +282,32 @@ async function handleApi(request, response, url) {
     if (request.method === 'GET') return json(response, 200, { export: exportItem });
   }
   return notFound(response);
+}
+
+async function purgeSession(sessionId) {
+  const [uploads, datasets, jobs, exports] = await Promise.all([
+    listEntities('uploads'), listEntities('datasets'), listEntities('jobs'), listEntities('exports'),
+  ]);
+  const sessionUploads = uploads.filter((item) => belongsToSession(item, sessionId));
+  const sessionDatasets = datasets.filter((item) => belongsToSession(item, sessionId));
+  const sessionJobs = jobs.filter((item) => belongsToSession(item, sessionId));
+  const sessionExports = exports.filter((item) => belongsToSession(item, sessionId));
+  await Promise.all(sessionDatasets.flatMap((dataset) => [rm(entityPath('datasets', dataset.id), { force: true }), rm(dataset.filePath, { force: true }), rm(treePath(dataset.id), { force: true })]));
+  await Promise.all(sessionUploads.flatMap((upload) => [rm(entityPath('uploads', upload.id), { force: true }), rm(uploadFilePath(upload.id), { force: true })]));
+  await Promise.all(sessionJobs.map((job) => rm(entityPath('jobs', job.id), { force: true })));
+  await Promise.all(sessionExports.flatMap((item) => [rm(entityPath('exports', item.id), { force: true }), rm(exportFilePath(item.id), { force: true })]));
+  const remainingUploadFiles = await readdir(paths.uploads);
+  await Promise.all(sessionUploads.flatMap((upload) => remainingUploadFiles.filter((name) => name.startsWith(`${upload.id}.`)).map((name) => rm(path.join(paths.uploads, name), { force: true }))));
+}
+
+async function purgeExpiredSessions() {
+  const entities = await Promise.all(['uploads', 'datasets', 'jobs', 'exports'].map((folder) => listEntities(folder)));
+  const latestBySession = new Map();
+  for (const items of entities) for (const item of items) {
+    const timestamp = Date.parse(item.updatedAt || item.createdAt || 0);
+    latestBySession.set(item.sessionId, Math.max(latestBySession.get(item.sessionId) || 0, timestamp));
+  }
+  for (const [sessionId, latest] of latestBySession) if (Date.now() - latest > sessionTtlMs) await purgeSession(sessionId);
 }
 
 async function staticFile(request, response, url) {
@@ -280,6 +323,7 @@ async function staticFile(request, response, url) {
 }
 
 await ensureStore();
+setInterval(() => void purgeExpiredSessions().catch((error) => console.error(error)), 10 * 60 * 1000).unref();
 for (const dataset of await listEntities('datasets')) {
   if (dataset.status === 'processing' || dataset.status === 'queued') {
     const job = await readEntity('jobs', dataset.jobId);

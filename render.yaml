@@ -5,8 +5,6 @@ services:
     healthCheckPath: /api/health
     envVars:
       - key: DATA_DIR
-        value: /data
-    disk:
-      name: transfer-data
-      mountPath: /data
-      sizeGB: 10
+        value: /tmp/trie-transfer-data
+      - key: SESSION_TTL_MS
+        value: '3600000'

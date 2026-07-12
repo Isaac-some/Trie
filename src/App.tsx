@@ -14,9 +14,16 @@ type Mapping = { source: string; destination: string };
 const formatNumber = (value: number) => new Intl.NumberFormat('zh-CN').format(value);
 const formatSize = (value: number) => value > 1024 * 1024 ? `${(value / 1024 / 1024).toFixed(1)} MB` : `${Math.ceil(value / 1024)} KB`;
 const resumableKey = (file: File) => `trie-upload:${file.name}:${file.size}:${file.lastModified}`;
+const pageSessionId = crypto.randomUUID();
+
+window.addEventListener('pagehide', () => {
+  void navigator.sendBeacon('/api/session/close', new Blob([], { type: 'application/octet-stream' }));
+});
 
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
+  const headers = new Headers(init?.headers);
+  headers.set('X-Session-Id', pageSessionId);
+  const response = await fetch(url, { ...init, headers });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(body.error || '请求失败');
   return body as T;
@@ -41,7 +48,7 @@ async function uploadCsv(file: File, update: (state: Partial<UploadState>) => vo
     let lastError: unknown;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        const response = await fetch(`/api/uploads/${upload.id}/chunks/${index}`, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': String(slice.size) }, body: slice });
+        const response = await fetch(`/api/uploads/${upload.id}/chunks/${index}`, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': String(slice.size), 'X-Session-Id': pageSessionId }, body: slice });
         if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || '分片上传失败');
         lastError = null;
         break;

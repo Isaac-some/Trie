@@ -1,8 +1,9 @@
 import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const root = process.env.DATA_DIR || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../data');
+const root = process.env.DATA_DIR || path.join(os.tmpdir(), 'trie-transfer-data');
 const folders = ['uploads', 'datasets', 'jobs', 'exports'];
 
 export const paths = Object.fromEntries(folders.map((folder) => [folder, path.join(root, folder)]));
