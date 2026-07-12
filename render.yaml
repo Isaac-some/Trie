@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: trie-transfer-service
+    runtime: docker
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATA_DIR
+        value: /data
+    disk:
+      name: transfer-data
+      mountPath: /data
+      sizeGB: 10

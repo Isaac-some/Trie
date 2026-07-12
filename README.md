@@ -25,3 +25,7 @@ npm run dev
 ```
 
 生产环境使用 Docker，并将 `/data` 挂载到持久化磁盘。GitHub Pages 不能运行本服务的上传和处理后端；请使用支持 Docker 和持久磁盘的服务部署。
+
+## Render 部署
+
+仓库已经包含 `render.yaml`。在 Render 中选择 New Blueprint，连接 `Isaac-some/Trie` 仓库和 `codex/persistent-csv-service` 分支，Render 会读取 Docker 配置、健康检查和 `/data` 持久磁盘设置。部署完成后，服务地址可以直接分享给使用者。
