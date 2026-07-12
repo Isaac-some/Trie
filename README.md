@@ -1,3 +1,9 @@
+---
+title: 传输路径分组
+sdk: docker
+app_port: 7860
+---
+
 # 传输路径分组服务
 
 面向大 CSV 的在线路径拆分与传输清单生成服务。
@@ -29,3 +35,7 @@ npm run dev
 ## Render 部署
 
 仓库已经包含 `render.yaml`。在 Render 中选择 New Blueprint，连接 `Isaac-some/Trie` 仓库和 `codex/persistent-csv-service` 分支，Render 会读取 Docker 配置和健康检查。应用按阅后即焚模式运行，不需要绑定持久磁盘；每个页面会话最多保留 1 小时的临时数据。
+
+## Hugging Face Spaces 部署
+
+也可以创建一个 Docker Space，把本仓库内容导入 Space。Space 配置已经声明端口 `7860`，不需要持久磁盘；页面刷新或关闭后当前会话会被清理。免费实例可能休眠或在长任务期间被回收，因此适合临时处理，不适合作为有 SLA 的生产服务。

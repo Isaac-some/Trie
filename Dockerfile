@@ -8,7 +8,7 @@ RUN npm run build
 FROM node:22-alpine
 WORKDIR /app
 ENV NODE_ENV=production
-ENV PORT=8787
+ENV PORT=7860
 ENV DATA_DIR=/data
 COPY package*.json ./
 RUN npm ci --omit=dev
