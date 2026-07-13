@@ -47,6 +47,10 @@ export function uploadPartPath(uploadId, index) {
   return path.join(paths.uploads, `${uploadId}.part.${index}`);
 }
 
+export function uploadPartHashPath(uploadId, index) {
+  return path.join(paths.uploads, `${uploadId}.part.${index}.sha256`);
+}
+
 export function uploadFilePath(uploadId) {
   return path.join(paths.uploads, `${uploadId}.csv`);
 }

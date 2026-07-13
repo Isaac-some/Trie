@@ -1,18 +1,31 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream, existsSync } from 'node:fs';
-import { access, readdir, rm, writeFile } from 'node:fs/promises';
+import { readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { csvCell, csvRecords, extractTosPaths, inspectCsv } from './csv.mjs';
 import { addPath, createTree, treePage } from './trie.mjs';
-import { ensureStore, entityPath, exportFilePath, listEntities, paths, readEntity, treePath, uploadFilePath, uploadPartPath, writeEntity } from './store.mjs';
+import { ensureStore, entityPath, exportFilePath, listEntities, paths, readEntity, treePath, uploadFilePath, uploadPartHashPath, uploadPartPath, writeEntity } from './store.mjs';
 
-const port = Number(process.env.PORT || 8787);
-const chunkSize = 5 * 1024 * 1024;
-const maxUploadSize = 512 * 1024 * 1024;
+const mib = 1024 * 1024;
+function positiveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const port = positiveInteger(process.env.PORT, 8787);
+const host = process.env.HOST || '127.0.0.1';
+const chunkSize = positiveInteger(process.env.UPLOAD_CHUNK_SIZE_MB, 8) * mib;
+const maxUploadSize = positiveInteger(process.env.MAX_UPLOAD_SIZE_MB, 500) * mib;
+const maxSessionSize = positiveInteger(process.env.MAX_SESSION_SIZE_MB, 512) * mib;
 const activeJobs = new Set();
+const activeMerges = new Set();
+const maxConcurrentJobs = positiveInteger(process.env.MAX_CONCURRENT_JOBS, 1);
+const queuedJobs = [];
+let runningJobs = 0;
 const sessionTtlMs = Number(process.env.SESSION_TTL_MS || 60 * 60 * 1000);
 const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const distRoot = path.join(appRoot, 'dist');
@@ -20,6 +33,41 @@ const distRoot = path.join(appRoot, 'dist');
 function now() { return new Date().toISOString(); }
 function id() { return randomUUID(); }
 function normalizeTarget(value) { const trimmed = String(value || '').trim(); return trimmed && !trimmed.endsWith('/') ? `${trimmed}/` : trimmed; }
+function normalizeSource(value) { const trimmed = String(value || '').trim(); return trimmed && !trimmed.endsWith('/') ? `${trimmed}/` : trimmed; }
+function rowKeyIndex(dataset) { return dataset.columns.find((column) => String(column.name).trim().toLowerCase() === 'rowkey')?.index ?? -1; }
+function normalizeMappings(rawMappings) {
+  const mappingsBySource = new Map();
+  for (const mapping of rawMappings || []) {
+    const source = normalizeSource(mapping.source);
+    const destination = normalizeTarget(mapping.destination);
+    if (!source || !destination) continue;
+    const existing = mappingsBySource.get(source);
+    if (existing && existing.destination !== destination) return { error: '同一起点分支只能对应一个传送终点' };
+    mappingsBySource.set(source, { source, destination });
+  }
+  const mappings = [...mappingsBySource.values()];
+  if (!mappings.length) return { error: '请先选择来源前缀并填写目的地' };
+  if (mappings.some((mapping, index) => mappings.some((other, otherIndex) => index !== otherIndex && mapping.source.startsWith(other.source)))) {
+    return { error: '起点分支不能互相包含，请只保留上层或下层其中一个分支' };
+  }
+  return { mappings };
+}
+
+function runNextJob() {
+  if (runningJobs >= maxConcurrentJobs) return;
+  const job = queuedJobs.shift();
+  if (!job) return;
+  runningJobs++;
+  void job().finally(() => {
+    runningJobs--;
+    runNextJob();
+  });
+}
+
+function enqueueJob(job) {
+  queuedJobs.push(job);
+  runNextJob();
+}
 
 function json(response, status, data) {
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -39,23 +87,60 @@ async function readJson(request) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
 }
 
-async function writeChunk(request, destination) {
-  const temporary = `${destination}.${id()}.uploading`;
-  await pipeline(request, createWriteStream(temporary, { flags: 'w' }));
-  await rm(destination, { force: true });
-  await writeFile(destination, await (await import('node:fs/promises')).readFile(temporary));
-  await rm(temporary, { force: true });
+function chunkByteLength(upload, index) {
+  const totalChunks = Math.ceil(upload.size / upload.chunkSize);
+  return index === totalChunks - 1 ? upload.size - index * upload.chunkSize : upload.chunkSize;
 }
 
-async function hasFile(filePath) {
-  try { await access(filePath); return true; } catch { return false; }
+function isSha256(value) {
+  return /^[a-f0-9]{64}$/i.test(String(value || ''));
+}
+
+function hashingStream(hash, onChunk) {
+  return new Transform({
+    transform(chunk, _encoding, callback) {
+      hash.update(chunk);
+      onChunk(chunk.length);
+      callback(null, chunk);
+    },
+  });
+}
+
+async function writeChunk(request, destination, hashDestination, expectedSize, expectedHash) {
+  const temporary = `${destination}.${id()}.uploading`;
+  const hash = createHash('sha256');
+  let receivedSize = 0;
+  try {
+    await pipeline(request, hashingStream(hash, (size) => { receivedSize += size; }), createWriteStream(temporary, { flags: 'wx' }));
+    const receivedHash = hash.digest('hex');
+    if (receivedSize !== expectedSize) throw new Error('分片大小不正确');
+    if (receivedHash !== expectedHash) throw new Error('分片校验失败，请重新上传该分片');
+    await rename(temporary, destination);
+    const hashTemporary = `${hashDestination}.${id()}.tmp`;
+    await writeFile(hashTemporary, receivedHash);
+    await rename(hashTemporary, hashDestination);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
+async function validChunk(upload, index) {
+  try {
+    const [part, digest] = await Promise.all([
+      stat(uploadPartPath(upload.id, index)),
+      readFile(uploadPartHashPath(upload.id, index), 'utf8'),
+    ]);
+    return part.size === chunkByteLength(upload, index) && isSha256(digest.trim());
+  } catch {
+    return false;
+  }
 }
 
 async function uploadResponse(upload) {
   const totalChunks = Math.ceil(upload.size / upload.chunkSize);
   const received = [];
   for (let index = 0; index < totalChunks; index++) {
-    if (await hasFile(uploadPartPath(upload.id, index))) received.push(index);
+    if (await validChunk(upload, index)) received.push(index);
   }
   return { upload: { ...upload, received, totalChunks } };
 }
@@ -78,13 +163,37 @@ async function listDatasets(sessionId) {
 
 async function joinParts(upload) {
   const finalPath = uploadFilePath(upload.id);
-  await rm(finalPath, { force: true });
+  const temporary = `${finalPath}.${id()}.merging`;
   const totalChunks = Math.ceil(upload.size / upload.chunkSize);
-  for (let index = 0; index < totalChunks; index++) {
-    await pipeline(createReadStream(uploadPartPath(upload.id, index)), createWriteStream(finalPath, { flags: 'a' }));
-    await rm(uploadPartPath(upload.id, index), { force: true });
+  try {
+    for (let index = 0; index < totalChunks; index++) {
+      const expectedHash = (await readFile(uploadPartHashPath(upload.id, index), 'utf8')).trim();
+      if (!isSha256(expectedHash)) throw new Error(`第 ${index + 1} 个分片校验信息无效`);
+      const hash = createHash('sha256');
+      let receivedSize = 0;
+      await pipeline(
+        createReadStream(uploadPartPath(upload.id, index)),
+        hashingStream(hash, (size) => { receivedSize += size; }),
+        createWriteStream(temporary, { flags: 'a' }),
+      );
+      if (receivedSize !== chunkByteLength(upload, index) || hash.digest('hex') !== expectedHash) {
+        throw new Error(`第 ${index + 1} 个分片校验失败，请重新上传该分片`);
+      }
+    }
+    if ((await stat(temporary)).size !== upload.size) throw new Error('合并后的文件大小不正确');
+    await rename(temporary, finalPath);
+    return finalPath;
+  } finally {
+    await rm(temporary, { force: true });
   }
-  return finalPath;
+}
+
+async function removeParts(upload) {
+  const totalChunks = Math.ceil(upload.size / upload.chunkSize);
+  await Promise.all([...Array(totalChunks).keys()].flatMap((index) => [
+    rm(uploadPartPath(upload.id, index), { force: true }),
+    rm(uploadPartHashPath(upload.id, index), { force: true }),
+  ]));
 }
 
 async function updateJob(job, patch) {
@@ -140,34 +249,42 @@ async function processDataset(datasetId, jobId) {
 }
 
 async function exportDataset(datasetId, exportId, jobId, mappings) {
+  return exportDatasets([{ datasetId, mappings }], exportId, jobId);
+}
+
+async function exportDatasets(entries, exportId, jobId) {
   if (activeJobs.has(jobId)) return;
   activeJobs.add(jobId);
   try {
-    const dataset = await readEntity('datasets', datasetId);
     const exportJob = await readEntity('exports', exportId);
     const job = await readEntity('jobs', jobId);
-    if (!dataset || !exportJob || !job) return;
+    if (!exportJob || !job) return;
     await updateJob(job, { status: 'running', startedAt: now() });
     const output = createWriteStream(exportFilePath(exportId));
     output.write('src_path,dst_path,rowkey\n');
     let rows = 0;
     let processedRows = 0;
-    let firstRow = true;
-    for await (const record of csvRecords(dataset.filePath)) {
-      if (firstRow) { firstRow = false; continue; }
-      processedRows++;
-      for (const column of dataset.selectedColumns) {
-        for (const sourcePath of extractTosPaths(record[column] || '')) {
-          for (const mapping of mappings) {
-            if (!sourcePath.startsWith(mapping.source)) continue;
-            const destination = `${mapping.destination}${sourcePath.slice(mapping.source.length)}`;
-            const rowKey = createHash('sha256').update(`${sourcePath}\n${destination}`).digest('hex');
-            if (!output.write(`${csvCell(sourcePath)},${csvCell(destination)},${rowKey}\n`)) await new Promise((resolve) => output.once('drain', resolve));
-            rows++;
+    for (const entry of entries) {
+      const dataset = await readEntity('datasets', entry.datasetId);
+      if (!dataset) throw new Error('找不到待导出的 CSV');
+      const sourceRowKeyIndex = rowKeyIndex(dataset);
+      if (sourceRowKeyIndex < 0) throw new Error('源 CSV 缺少 rowkey 表头');
+      let firstRow = true;
+      for await (const record of csvRecords(dataset.filePath)) {
+        if (firstRow) { firstRow = false; continue; }
+        processedRows++;
+        for (const column of dataset.selectedColumns) {
+          for (const sourcePath of extractTosPaths(record[column] || '')) {
+            for (const mapping of entry.mappings) {
+              if (!sourcePath.startsWith(mapping.source)) continue;
+              const destination = `${mapping.destination}${sourcePath.slice(mapping.source.length)}`;
+              if (!output.write(`${csvCell(sourcePath)},${csvCell(destination)},${csvCell(record[sourceRowKeyIndex] || '')}\n`)) await new Promise((resolve) => output.once('drain', resolve));
+              rows++;
+            }
           }
         }
+        if (processedRows % 5000 === 0) await updateJob(job, { progress: { processedRows, rows } });
       }
-      if (processedRows % 5000 === 0) await updateJob(job, { progress: { processedRows, rows } });
     }
     await new Promise((resolve, reject) => output.end((error) => error ? reject(error) : resolve()));
     await updateJob(job, { status: 'completed', progress: { processedRows, rows }, completedAt: now() });
@@ -192,14 +309,37 @@ async function handleApi(request, response, url) {
   }
   if (request.method === 'GET' && url.pathname === '/api/datasets') return json(response, 200, { datasets: await listDatasets(sessionId) });
 
+  if (request.method === 'POST' && url.pathname === '/api/exports') {
+    const body = await readJson(request);
+    const entries = [];
+    for (const entry of body.entries || []) {
+      const dataset = await readEntity('datasets', String(entry.datasetId || ''));
+      if (!dataset || !belongsToSession(dataset, sessionId)) return notFound(response);
+      if (rowKeyIndex(dataset) < 0) return json(response, 400, { error: `${dataset.name} 缺少 rowkey 表头，无法生成可追溯的传输清单` });
+      const normalized = normalizeMappings(entry.mappings);
+      if (normalized.error) return json(response, 400, { error: `${dataset.name}：${normalized.error}` });
+      entries.push({ datasetId: dataset.id, mappings: normalized.mappings });
+    }
+    if (!entries.length) return json(response, 400, { error: '请先在至少一棵路径树中完成起点和终点匹配' });
+    const exportItem = { id: id(), sessionId, datasetIds: entries.map((entry) => entry.datasetId), name: 'transfer-all.csv', status: 'queued', createdAt: now() };
+    const job = { id: id(), sessionId, type: 'export_csv', datasetIds: exportItem.datasetIds, exportId: exportItem.id, status: 'queued', progress: { processedRows: 0, rows: 0 }, createdAt: now(), updatedAt: now() };
+    await writeEntity('exports', exportItem.id, exportItem);
+    await writeEntity('jobs', job.id, job);
+    enqueueJob(() => exportDatasets(entries, exportItem.id, job.id));
+    return json(response, 202, { exportId: exportItem.id, jobId: job.id });
+  }
+
   if (request.method === 'POST' && url.pathname === '/api/uploads/init') {
     const body = await readJson(request);
     const name = String(body.name || '').trim();
     const size = Number(body.size || 0);
     const fingerprint = String(body.fingerprint || '');
-    if (!name.toLowerCase().endsWith('.csv') || !size || size > maxUploadSize) return json(response, 400, { error: '请上传小于 512MB 的 CSV 文件' });
-    const existing = (await listEntities('uploads')).find((item) => belongsToSession(item, sessionId) && item.fingerprint === fingerprint && item.size === size && item.status !== 'completed');
+    if (!name.toLowerCase().endsWith('.csv') || !Number.isFinite(size) || size <= 0 || size > maxUploadSize) return json(response, 400, { error: `请上传不超过 ${maxUploadSize / mib}MB 的 CSV 文件` });
+    const sessionUploads = (await listEntities('uploads')).filter((item) => belongsToSession(item, sessionId));
+    const existing = sessionUploads.find((item) => item.fingerprint === fingerprint && item.size === size && item.status !== 'completed');
     if (existing) return json(response, 200, await uploadResponse(existing));
+    const usedBytes = sessionUploads.reduce((total, item) => total + Number(item.size || 0), 0);
+    if (usedBytes + size > maxSessionSize) return json(response, 400, { error: `本次会话的文件总大小不能超过 ${maxSessionSize / mib}MB` });
     const upload = { id: id(), sessionId, name, size, fingerprint, chunkSize, status: 'uploading', createdAt: now(), updatedAt: now() };
     await writeEntity('uploads', upload.id, upload);
     return json(response, 201, await uploadResponse(upload));
@@ -213,23 +353,35 @@ async function handleApi(request, response, url) {
       const index = Number(parts[4]);
       const totalChunks = Math.ceil(upload.size / upload.chunkSize);
       if (!Number.isInteger(index) || index < 0 || index >= totalChunks) return json(response, 400, { error: '分片编号无效' });
-      const expected = index === totalChunks - 1 ? upload.size - index * upload.chunkSize : upload.chunkSize;
+      const expected = chunkByteLength(upload, index);
       const contentLength = Number(request.headers['content-length'] || 0);
+      const expectedHash = String(request.headers['x-chunk-sha256'] || '').toLowerCase();
       if (contentLength && contentLength !== expected) return json(response, 400, { error: '分片大小不正确' });
-      await writeChunk(request, uploadPartPath(upload.id, index));
-      await writeEntity('uploads', upload.id, { ...upload, updatedAt: now() });
+      if (!isSha256(expectedHash)) return json(response, 400, { error: '分片缺少有效的完整性校验值' });
+      try {
+        await writeChunk(request, uploadPartPath(upload.id, index), uploadPartHashPath(upload.id, index), expected, expectedHash);
+      } catch (error) {
+        return json(response, 400, { error: error instanceof Error ? error.message : '分片上传失败' });
+      }
       return json(response, 200, { ok: true, index });
     }
     if (request.method === 'POST' && parts[3] === 'complete') {
-      const current = await uploadResponse(upload);
-      if (current.upload.received.length !== current.upload.totalChunks) return json(response, 409, { error: '仍有分片未上传完成', ...current });
       if (upload.datasetId) return json(response, 200, { datasetId: upload.datasetId });
-      const filePath = await joinParts(upload);
-      const columns = await inspectCsv(filePath);
-      const dataset = { id: id(), sessionId, uploadId: upload.id, name: upload.name, filePath, size: upload.size, columns, selectedColumns: [], status: 'needs_columns', createdAt: now(), updatedAt: now() };
-      await writeEntity('datasets', dataset.id, dataset);
-      await writeEntity('uploads', upload.id, { ...upload, status: 'completed', datasetId: dataset.id, updatedAt: now() });
-      return json(response, 201, { datasetId: dataset.id });
+      if (activeMerges.has(upload.id)) return json(response, 409, { error: '文件正在合并，请稍候' });
+      activeMerges.add(upload.id);
+      try {
+        const current = await uploadResponse(upload);
+        if (current.upload.received.length !== current.upload.totalChunks) return json(response, 409, { error: '仍有分片未上传完成', ...current });
+        const filePath = await joinParts(upload);
+        const columns = await inspectCsv(filePath);
+        const dataset = { id: id(), sessionId, uploadId: upload.id, name: upload.name, filePath, size: upload.size, columns, selectedColumns: [], status: 'needs_columns', createdAt: now(), updatedAt: now() };
+        await writeEntity('datasets', dataset.id, dataset);
+        await writeEntity('uploads', upload.id, { ...upload, status: 'completed', datasetId: dataset.id, updatedAt: now() });
+        await removeParts(upload);
+        return json(response, 201, { datasetId: dataset.id });
+      } finally {
+        activeMerges.delete(upload.id);
+      }
     }
   }
 
@@ -244,7 +396,7 @@ async function handleApi(request, response, url) {
       const job = { id: id(), sessionId, type: 'build_tree', datasetId: dataset.id, status: 'queued', progress: { processedRows: 0, pathCount: 0 }, createdAt: now(), updatedAt: now() };
       await writeEntity('jobs', job.id, job);
       await writeEntity('datasets', dataset.id, { ...dataset, selectedColumns, status: 'queued', jobId: job.id, updatedAt: now() });
-      void processDataset(dataset.id, job.id);
+      enqueueJob(() => processDataset(dataset.id, job.id));
       return json(response, 202, { jobId: job.id });
     }
     if (request.method === 'GET' && parts[3] === 'tree') {
@@ -254,15 +406,16 @@ async function handleApi(request, response, url) {
       return result ? json(response, 200, result) : notFound(response);
     }
     if (request.method === 'POST' && parts[3] === 'exports') {
+      if (rowKeyIndex(dataset) < 0) return json(response, 400, { error: '源 CSV 缺少 rowkey 表头，无法生成可追溯的传输清单' });
       const body = await readJson(request);
-      const mappings = (body.mappings || []).map((mapping) => ({ source: String(mapping.source || '').trim(), destination: normalizeTarget(mapping.destination) }))
-        .filter((mapping) => mapping.source && mapping.destination);
-      if (!mappings.length) return json(response, 400, { error: '请先选择来源前缀并填写目的地' });
+      const normalized = normalizeMappings(body.mappings);
+      if (normalized.error) return json(response, 400, { error: normalized.error });
+      const { mappings } = normalized;
       const exportItem = { id: id(), sessionId, datasetId: dataset.id, name: `${dataset.name.replace(/\.csv$/i, '')}-transfer.csv`, status: 'queued', createdAt: now() };
       const job = { id: id(), sessionId, type: 'export_csv', datasetId: dataset.id, exportId: exportItem.id, status: 'queued', progress: { processedRows: 0, rows: 0 }, createdAt: now(), updatedAt: now() };
       await writeEntity('exports', exportItem.id, exportItem);
       await writeEntity('jobs', job.id, job);
-      void exportDataset(dataset.id, exportItem.id, job.id, mappings);
+      enqueueJob(() => exportDataset(dataset.id, exportItem.id, job.id, mappings));
       return json(response, 202, { exportId: exportItem.id, jobId: job.id });
     }
   }
@@ -327,7 +480,7 @@ setInterval(() => void purgeExpiredSessions().catch((error) => console.error(err
 for (const dataset of await listEntities('datasets')) {
   if (dataset.status === 'processing' || dataset.status === 'queued') {
     const job = await readEntity('jobs', dataset.jobId);
-    if (job?.type === 'build_tree') void processDataset(dataset.id, job.id);
+    if (job?.type === 'build_tree') enqueueJob(() => processDataset(dataset.id, job.id));
   }
 }
 
@@ -341,4 +494,4 @@ http.createServer(async (request, response) => {
     if (!response.headersSent) json(response, 500, { error: error instanceof Error ? error.message : '服务器处理失败' });
     else response.end();
   }
-}).listen(port, '0.0.0.0', () => console.log(`Transfer service listening on ${port}`));
+}).listen(port, host, () => console.log(`Transfer service listening on http://${host}:${port}`));

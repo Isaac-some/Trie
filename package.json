@@ -7,7 +7,10 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "start": "node server/index.mjs"
+    "start": "node server/index.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "local": "node scripts/local.mjs",
+    "test": "node --test"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.3.1",

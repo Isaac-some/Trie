@@ -73,7 +73,22 @@ export function treePage(root, selectedPath, offset = 0, limit = 5) {
       fileCount: child.fileCount,
       childCount: Object.keys(child.children).length,
       samples: child.samples.slice(0, 5),
+      autoBranch: singleBranch(child),
     })),
     nextOffset: offset + limit < children.length ? offset + limit : null,
   };
+}
+
+function singleBranch(node) {
+  if (Object.keys(node.children).length !== 1) return [];
+  const child = Object.values(node.children)[0];
+  return [{
+    name: child.name,
+    fullPath: child.fullPath,
+    leafCount: child.leafCount,
+    fileCount: child.fileCount,
+    childCount: Object.keys(child.children).length,
+    samples: child.samples.slice(0, 5),
+    autoBranch: singleBranch(child),
+  }];
 }
