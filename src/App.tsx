@@ -11,6 +11,7 @@ type TreePage = { node: TreeItem & { split?: { branches: number; ratio: number }
 type UploadState = { name: string; progress: number; message: string; error?: string };
 type Destination = { id: string; path: string };
 type Mapping = { source: string; destination: string };
+type StorageSummary = { usedBytes: number; limitBytes: number; warning: boolean };
 
 const formatNumber = (value: number) => new Intl.NumberFormat('zh-CN').format(value);
 const formatSize = (value: number) => value > 1024 * 1024 ? `${(value / 1024 / 1024).toFixed(1)} MB` : `${Math.ceil(value / 1024)} KB`;
@@ -75,6 +76,7 @@ async function uploadCsv(file: File, update: (state: Partial<UploadState>) => vo
 
 export default function App() {
   const [datasets, setDatasets] = useState<Dataset[]>([]);
+  const [storage, setStorage] = useState<StorageSummary>({ usedBytes: 0, limitBytes: 1024 * 1024 * 1024, warning: false });
   const [uploads, setUploads] = useState<UploadState[]>([]);
   const [destinations, setDestinations] = useState<Destination[]>([]);
   const [mappingsByDataset, setMappingsByDataset] = useState<Record<string, Mapping[]>>({});
@@ -85,7 +87,11 @@ export default function App() {
   const fileInput = useRef<HTMLInputElement>(null);
 
   const refresh = useCallback(async () => {
-    try { setDatasets((await api<{ datasets: Dataset[] }>('/api/datasets')).datasets); } catch { /* Server may be starting. */ }
+    try {
+      const result = await api<{ datasets: Dataset[]; storage: StorageSummary }>('/api/datasets');
+      setDatasets(result.datasets);
+      setStorage(result.storage);
+    } catch { /* Server may be starting. */ }
   }, []);
 
   useEffect(() => { void refresh(); const timer = window.setInterval(() => void refresh(), 2500); return () => window.clearInterval(timer); }, [refresh]);
@@ -108,6 +114,14 @@ export default function App() {
   const addDestination = () => setDestinations((current) => [...current, { id: crypto.randomUUID(), path: '' }]);
   const updateDestination = (id: string, path: string) => setDestinations((current) => current.map((destination) => destination.id === id ? { ...destination, path } : destination));
   const removeDestination = (id: string) => setDestinations((current) => current.filter((destination) => destination.id !== id));
+  const deleteDataset = useCallback(async (datasetId: string) => {
+    await api(`/api/datasets/${datasetId}`, { method: 'DELETE' });
+    setMappingsByDataset((current) => {
+      const { [datasetId]: _removed, ...remaining } = current;
+      return remaining;
+    });
+    await refresh();
+  }, [refresh]);
   const updateDatasetMappings = useCallback((datasetId: string, mappings: Mapping[]) => setMappingsByDataset((current) => sameMappings(current[datasetId], mappings) ? current : { ...current, [datasetId]: mappings }), []);
   const exportEntries = useMemo(() => datasets.map((dataset) => ({ datasetId: dataset.id, mappings: mappingsByDataset[dataset.id] || [] })).filter((entry) => entry.mappings.length), [datasets, mappingsByDataset]);
   const totalPairs = exportEntries.reduce((total, entry) => total + entry.mappings.filter((mapping) => mapping.destination).length, 0);
@@ -150,10 +164,11 @@ export default function App() {
         </section>
         <section className="side-section"><div className="section-heading"><span>上传队列</span><span>{uploads.length}</span></div>{uploads.length ? uploads.map((item) => <UploadRow key={item.name} upload={item} />) : <p className="quiet">暂无上传任务</p>}</section>
         <section className="side-section"><div className="section-heading"><span>文件输入</span><span>{datasets.length}</span></div>{datasets.length ? datasets.map((dataset, index) => <div className="dataset-summary" key={dataset.id}><span className="input-number">{String(index + 1).padStart(2, '0')}</span><div><strong>{dataset.name}</strong><small>{formatSize(dataset.size)} · {statusLabel(dataset.status)}</small></div></div>) : <p className="quiet">上传完成后按文件名建立独立输入</p>}</section>
+        <section className={storage.warning ? 'side-section storage-warning' : 'side-section storage-status'}><div className="section-heading"><span>本机临时数据</span><span>{formatSize(storage.usedBytes)} / {formatSize(storage.limitBytes)}</span></div><p className="quiet">{storage.warning ? '已接近上限，请删除不再使用的文件树。' : '删除文件会一并清理其路径树、后台任务和临时文件。'}</p></section>
       </aside>
       <section className="content"><div className="content-heading"><div><h2>输入与路径树</h2><p>每个 CSV 独立选择起点；传送终点可跨文件复用。</p></div><button className="icon-button" aria-label="刷新任务" onClick={() => void refresh()}>↻</button></div>
         <DestinationLibrary destinations={destinations} onAdd={addDestination} onUpdate={updateDestination} onRemove={removeDestination} />
-        {datasets.length ? datasets.map((dataset, index) => <DatasetPanel key={dataset.id} dataset={dataset} number={index + 1} onChange={refresh} destinations={destinations} onMappingsChange={updateDatasetMappings} />) : <div className="empty">上传 CSV 后，每个文件会在这里出现一棵独立路径树。</div>}
+        {datasets.length ? datasets.map((dataset, index) => <DatasetPanel key={dataset.id} dataset={dataset} number={index + 1} onChange={refresh} onDelete={deleteDataset} destinations={destinations} onMappingsChange={updateDatasetMappings} />) : <div className="empty">上传 CSV 后，每个文件会在这里出现一棵独立路径树。</div>}
       </section>
     </main>
   </div>;
@@ -167,17 +182,28 @@ function DestinationLibrary({ destinations, onAdd, onUpdate, onRemove }: { desti
   return <section className="destination-library" aria-labelledby="destination-library-title"><header><div><h3 id="destination-library-title">传送终点库</h3><p>所有路径树共用；在各自的起点分支中选择即可。</p></div><button className="secondary-button" onClick={onAdd}>+ 添加终点</button></header>{destinations.length ? <div className="destination-library-list">{destinations.map((destination, index) => <label className="destination-row" key={destination.id}><span>终点 {String(index + 1).padStart(2, '0')}</span><input value={destination.path} placeholder="cos://bucket/prefix/" onChange={(event) => onUpdate(destination.id, event.target.value)} /><button className="remove-button" type="button" onClick={() => onRemove(destination.id)}>移除</button></label>)}</div> : <p className="quiet">先添加一个传送终点，再在每个 CSV 的起点分支中选择它。</p>}</section>;
 }
 
-function DatasetPanel({ dataset, number, onChange, destinations, onMappingsChange }: { dataset: Dataset; number: number; onChange: () => Promise<void>; destinations: Destination[]; onMappingsChange: (datasetId: string, mappings: Mapping[]) => void }) {
+function DatasetPanel({ dataset, number, onChange, onDelete, destinations, onMappingsChange }: { dataset: Dataset; number: number; onChange: () => Promise<void>; onDelete: (datasetId: string) => Promise<void>; destinations: Destination[]; onMappingsChange: (datasetId: string, mappings: Mapping[]) => void }) {
   const [job, setJob] = useState<Job | null>(null);
   const [expanded, setExpanded] = useState(true);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState('');
   useEffect(() => {
     if (!dataset.jobId || !['queued', 'processing'].includes(dataset.status)) { setJob(null); return; }
     let active = true;
     const poll = async () => { try { const result = await api<{ job: Job }>(`/api/jobs/${dataset.jobId}`); if (active) setJob(result.job); } catch { } };
     void poll(); const timer = window.setInterval(() => void poll(), 1200); return () => { active = false; window.clearInterval(timer); };
   }, [dataset.jobId, dataset.status]);
-  return <article className="dataset-panel"><header><button className="collapse" onClick={() => setExpanded((value) => !value)} aria-label={expanded ? '收起文件' : '展开文件'}>{expanded ? '−' : '+'}</button><span className="input-number">{String(number).padStart(2, '0')}</span><div className="dataset-title"><h3>{dataset.name}</h3><p>{formatSize(dataset.size)} · {statusLabel(dataset.status)}</p></div>{dataset.stats && <span className="stats">{formatNumber(dataset.stats.pathCount)} 条路径</span>}</header>
+  const remove = async () => {
+    if (!window.confirm(`确定删除“${dataset.name}”吗？该文件的路径树和未下载导出结果会一并删除。`)) return;
+    setDeleting(true);
+    setDeleteError('');
+    try { await onDelete(dataset.id); }
+    catch (error) { setDeleteError(error instanceof Error ? error.message : '删除失败，请重试。'); }
+    finally { setDeleting(false); }
+  };
+  return <article className="dataset-panel"><header><button className="collapse" disabled={deleting} onClick={() => setExpanded((value) => !value)} aria-label={expanded ? '收起文件' : '展开文件'}>{expanded ? '−' : '+'}</button><span className="input-number">{String(number).padStart(2, '0')}</span><div className="dataset-title"><h3>{dataset.name}</h3><p>{formatSize(dataset.size)} · {statusLabel(dataset.status)}</p></div>{dataset.stats && <span className="stats">{formatNumber(dataset.stats.pathCount)} 条路径</span>}<div className="dataset-actions"><button className="remove-button" disabled={deleting} onClick={() => void remove()}>{deleting ? '删除中' : '删除文件'}</button></div></header>
     {expanded && <div className="dataset-body">
+      {deleteError && <div className="error-state">{deleteError}</div>}
       {dataset.status === 'needs_columns' && <ColumnSelection dataset={dataset} onChange={onChange} />}
       {['queued', 'processing'].includes(dataset.status) && <JobProgress job={job} />}
       {dataset.status === 'failed' && <div className="error-state">{dataset.error || '处理失败。请重新上传或稍后重试。'}</div>}

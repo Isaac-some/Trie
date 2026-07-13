@@ -21,8 +21,11 @@ const host = process.env.HOST || '127.0.0.1';
 const chunkSize = positiveInteger(process.env.UPLOAD_CHUNK_SIZE_MB, 8) * mib;
 const maxUploadSize = positiveInteger(process.env.MAX_UPLOAD_SIZE_MB, 500) * mib;
 const maxSessionSize = positiveInteger(process.env.MAX_SESSION_SIZE_MB, 512) * mib;
+const maxSessionStorageSize = positiveInteger(process.env.MAX_SESSION_STORAGE_MB, 1024) * mib;
 const activeJobs = new Set();
 const activeMerges = new Set();
+const cancelledDatasetIds = new Set();
+const cancelledJobIds = new Set();
 const maxConcurrentJobs = positiveInteger(process.env.MAX_CONCURRENT_JOBS, 1);
 const queuedJobs = [];
 let runningJobs = 0;
@@ -161,6 +164,29 @@ async function listDatasets(sessionId) {
     .map(({ filePath, ...dataset }) => dataset);
 }
 
+async function existingFileSize(filePath) {
+  try { return (await stat(filePath)).size; } catch { return 0; }
+}
+
+async function storageSummary(sessionId) {
+  const [uploads, datasets, exports] = await Promise.all([
+    listEntities('uploads'), listEntities('datasets'), listEntities('exports'),
+  ]);
+  const sessionUploads = uploads.filter((item) => belongsToSession(item, sessionId));
+  const filePaths = new Set();
+  for (const dataset of datasets.filter((item) => belongsToSession(item, sessionId))) {
+    filePaths.add(dataset.filePath);
+    filePaths.add(treePath(dataset.id));
+  }
+  for (const item of exports.filter((entry) => belongsToSession(entry, sessionId))) filePaths.add(exportFilePath(item.id));
+  const uploadFiles = await readdir(paths.uploads);
+  for (const upload of sessionUploads) {
+    for (const name of uploadFiles) if (name.startsWith(`${upload.id}.`) && !name.endsWith('.json')) filePaths.add(path.join(paths.uploads, name));
+  }
+  const usedBytes = (await Promise.all([...filePaths].map(existingFileSize))).reduce((total, size) => total + size, 0);
+  return { usedBytes, limitBytes: maxSessionStorageSize, warning: usedBytes >= maxSessionStorageSize * 0.8 };
+}
+
 async function joinParts(upload) {
   const finalPath = uploadFilePath(upload.id);
   const temporary = `${finalPath}.${id()}.merging`;
@@ -197,6 +223,7 @@ async function removeParts(upload) {
 }
 
 async function updateJob(job, patch) {
+  if (cancelledJobIds.has(job.id)) return;
   Object.assign(job, patch, { updatedAt: now() });
   await writeEntity('jobs', job.id, job);
 }
@@ -205,6 +232,7 @@ async function processDataset(datasetId, jobId) {
   if (activeJobs.has(jobId)) return;
   activeJobs.add(jobId);
   try {
+    if (cancelledDatasetIds.has(datasetId) || cancelledJobIds.has(jobId)) return;
     const dataset = await readEntity('datasets', datasetId);
     const job = await readEntity('jobs', jobId);
     if (!dataset || !job) return;
@@ -230,7 +258,9 @@ async function processDataset(datasetId, jobId) {
         await updateJob(job, { progress: { processedRows, pathCount } });
       }
     }
+    if (cancelledDatasetIds.has(datasetId) || cancelledJobIds.has(jobId)) return;
     await writeFile(treePath(datasetId), JSON.stringify(tree));
+    if (cancelledDatasetIds.has(datasetId) || cancelledJobIds.has(jobId)) return;
     await updateJob(job, { status: 'completed', progress: { processedRows, pathCount }, completedAt: now() });
     await writeEntity('datasets', datasetId, {
       ...dataset,
@@ -245,6 +275,8 @@ async function processDataset(datasetId, jobId) {
     if (dataset) await writeEntity('datasets', datasetId, { ...dataset, status: 'failed', error: '处理失败，请重试', updatedAt: now() });
   } finally {
     activeJobs.delete(jobId);
+    cancelledDatasetIds.delete(datasetId);
+    cancelledJobIds.delete(jobId);
   }
 }
 
@@ -256,6 +288,7 @@ async function exportDatasets(entries, exportId, jobId) {
   if (activeJobs.has(jobId)) return;
   activeJobs.add(jobId);
   try {
+    if (cancelledJobIds.has(jobId)) return;
     const exportJob = await readEntity('exports', exportId);
     const job = await readEntity('jobs', jobId);
     if (!exportJob || !job) return;
@@ -296,7 +329,41 @@ async function exportDatasets(entries, exportId, jobId) {
     if (exportJob) await writeEntity('exports', exportId, { ...exportJob, status: 'failed', error: '导出失败' });
   } finally {
     activeJobs.delete(jobId);
+    cancelledJobIds.delete(jobId);
   }
+}
+
+function jobUsesDataset(job, datasetId, exportIds) {
+  return job.datasetId === datasetId
+    || job.datasetIds?.includes(datasetId)
+    || (job.exportId && exportIds.has(job.exportId));
+}
+
+async function removeDataset(sessionId, dataset) {
+  const [uploads, jobs, exports] = await Promise.all([
+    listEntities('uploads'), listEntities('jobs'), listEntities('exports'),
+  ]);
+  const relatedUploads = uploads.filter((upload) => belongsToSession(upload, sessionId) && (upload.id === dataset.uploadId || upload.datasetId === dataset.id));
+  const relatedExports = exports.filter((item) => belongsToSession(item, sessionId) && (item.datasetId === dataset.id || item.datasetIds?.includes(dataset.id)));
+  const exportIds = new Set(relatedExports.map((item) => item.id));
+  const relatedJobs = jobs.filter((job) => belongsToSession(job, sessionId) && jobUsesDataset(job, dataset.id, exportIds));
+
+  cancelledDatasetIds.add(dataset.id);
+  for (const job of relatedJobs) cancelledJobIds.add(job.id);
+
+  await Promise.all([
+    rm(entityPath('datasets', dataset.id), { force: true }),
+    rm(dataset.filePath, { force: true }),
+    rm(treePath(dataset.id), { force: true }),
+    ...relatedUploads.flatMap((upload) => [rm(entityPath('uploads', upload.id), { force: true }), rm(uploadFilePath(upload.id), { force: true })]),
+    ...relatedJobs.map((job) => rm(entityPath('jobs', job.id), { force: true })),
+    ...relatedExports.flatMap((item) => [rm(entityPath('exports', item.id), { force: true }), rm(exportFilePath(item.id), { force: true })]),
+  ]);
+
+  const remainingUploadFiles = await readdir(paths.uploads);
+  await Promise.all(relatedUploads.flatMap((upload) => remainingUploadFiles
+    .filter((name) => name.startsWith(`${upload.id}.`))
+    .map((name) => rm(path.join(paths.uploads, name), { force: true }))));
 }
 
 async function handleApi(request, response, url) {
@@ -307,7 +374,7 @@ async function handleApi(request, response, url) {
     await purgeSession(sessionId);
     return json(response, 200, { ok: true });
   }
-  if (request.method === 'GET' && url.pathname === '/api/datasets') return json(response, 200, { datasets: await listDatasets(sessionId) });
+  if (request.method === 'GET' && url.pathname === '/api/datasets') return json(response, 200, { datasets: await listDatasets(sessionId), storage: await storageSummary(sessionId) });
 
   if (request.method === 'POST' && url.pathname === '/api/exports') {
     const body = await readJson(request);
@@ -340,6 +407,8 @@ async function handleApi(request, response, url) {
     if (existing) return json(response, 200, await uploadResponse(existing));
     const usedBytes = sessionUploads.reduce((total, item) => total + Number(item.size || 0), 0);
     if (usedBytes + size > maxSessionSize) return json(response, 400, { error: `本次会话的文件总大小不能超过 ${maxSessionSize / mib}MB` });
+    const storage = await storageSummary(sessionId);
+    if (storage.usedBytes + size > maxSessionStorageSize) return json(response, 400, { error: `本机临时数据已使用 ${Math.ceil(storage.usedBytes / mib)}MB，请先删除不再使用的文件树后再上传` });
     const upload = { id: id(), sessionId, name, size, fingerprint, chunkSize, status: 'uploading', createdAt: now(), updatedAt: now() };
     await writeEntity('uploads', upload.id, upload);
     return json(response, 201, await uploadResponse(upload));
@@ -389,6 +458,10 @@ async function handleApi(request, response, url) {
     const dataset = await readEntity('datasets', parts[2]);
     if (!dataset || !belongsToSession(dataset, sessionId)) return notFound(response);
     if (request.method === 'GET' && parts.length === 3) return json(response, 200, { dataset: { ...dataset, filePath: undefined } });
+    if (request.method === 'DELETE' && parts.length === 3) {
+      await removeDataset(sessionId, dataset);
+      return json(response, 200, { ok: true });
+    }
     if (request.method === 'POST' && parts[3] === 'process') {
       const body = await readJson(request);
       const selectedColumns = [...new Set((body.selectedColumns || []).map(Number).filter((index) => Number.isInteger(index) && index >= 0 && index < dataset.columns.length))];

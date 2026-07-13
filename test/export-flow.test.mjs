@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -8,12 +8,12 @@ import test from 'node:test';
 const root = path.resolve(import.meta.dirname, '..');
 const sessionId = 'export-flow-test';
 
-async function startServer() {
+async function startServer(extraEnv = {}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'trie-export-test-'));
   const port = 39000 + Math.floor(Math.random() * 1000);
   const child = spawn(process.execPath, ['server/index.mjs'], {
     cwd: root,
-    env: { ...process.env, DATA_DIR: dataDir, HOST: '127.0.0.1', PORT: String(port) },
+    env: { ...process.env, ...extraEnv, DATA_DIR: dataDir, HOST: '127.0.0.1', PORT: String(port) },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   await new Promise((resolve, reject) => {
@@ -110,6 +110,19 @@ test('exports a source/destination CSV and preserves the session for download', 
   const download = await request(server.baseUrl, `/api/exports/${exportJob.exportId}/download`);
   assert.equal(download.status, 200);
   assert.equal(await download.text(), 'src_path,dst_path,rowkey\ntos://1/2/3/file.jpg,cos://5/file.jpg,original-row-key-001\n');
+
+  const deleteResponse = await request(server.baseUrl, `/api/datasets/${datasetId}`, { method: 'DELETE' });
+  assert.equal(deleteResponse.status, 200);
+  const datasetsResponse = await request(server.baseUrl, '/api/datasets');
+  assert.equal(datasetsResponse.status, 200);
+  const remaining = await datasetsResponse.json();
+  assert.deepEqual(remaining.datasets, []);
+  assert.equal(remaining.storage.usedBytes, 0);
+  assert.equal((await request(server.baseUrl, `/api/datasets/${datasetId}`)).status, 404);
+  assert.equal((await request(server.baseUrl, `/api/uploads/${upload.id}`)).status, 404);
+  await assert.rejects(access(path.join(server.dataDir, 'uploads', `${upload.id}.csv`)));
+  await assert.rejects(access(path.join(server.dataDir, 'datasets', `${datasetId}.tree.json`)));
+  await assert.rejects(access(path.join(server.dataDir, 'exports', `${exportJob.exportId}.csv`)));
 });
 
 test('accepts a 500MB CSV upload plan as 8MB verified chunks', async (t) => {
@@ -154,4 +167,31 @@ test('merges verified chunks byte-for-byte before deleting the source parts', as
   const completeResponse = await request(server.baseUrl, `/api/uploads/${upload.id}/complete`, { method: 'POST' });
   assert.equal(completeResponse.status, 201);
   assert.deepEqual(await readFile(path.join(server.dataDir, 'uploads', `${upload.id}.csv`)), payload);
+});
+
+test('warns near the local storage limit and blocks another upload beyond it', async (t) => {
+  const server = await startServer({ MAX_SESSION_STORAGE_MB: '1' });
+  t.after(() => server.stop());
+  const csv = Buffer.concat([Buffer.from('rowkey,path\n'), Buffer.alloc(850 * 1024, 'x')]);
+  const initResponse = await request(server.baseUrl, '/api/uploads/init', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'near-limit.csv', size: csv.length, fingerprint: 'near-limit.csv:test' }),
+  });
+  const { upload } = await initResponse.json();
+  const chunkResponse = await request(server.baseUrl, `/api/uploads/${upload.id}/chunks/0`, {
+    method: 'PUT', headers: { 'X-Chunk-SHA256': await sha256(csv) }, body: csv,
+  });
+  assert.equal(chunkResponse.status, 200);
+  assert.equal((await request(server.baseUrl, `/api/uploads/${upload.id}/complete`, { method: 'POST' })).status, 201);
+  const summary = await (await request(server.baseUrl, '/api/datasets')).json();
+  assert.equal(summary.storage.warning, true);
+
+  const blocked = await request(server.baseUrl, '/api/uploads/init', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'another.csv', size: 250 * 1024, fingerprint: 'another.csv:test' }),
+  });
+  assert.equal(blocked.status, 400);
+  assert.match((await blocked.json()).error, /删除/);
 });
