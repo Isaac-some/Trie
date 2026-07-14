@@ -27,6 +27,6 @@ status('Node.js', nodeMajor >= requiredNodeMajor, `${process.versions.node}（�
 status('npm', Boolean(process.env.npm_config_user_agent), process.env.npm_config_user_agent?.match(/npm\/[^ ]+/)?.[0] || '请通过 npm 运行此检查');
 status('项目依赖', dependenciesInstalled, dependenciesInstalled ? '已安装' : '尚未安装');
 status('前端构建', buildExists, buildExists ? '已生成' : '首次启动会自动生成');
-status('本地访问', true, '默认仅监听 http://127.0.0.1:8787，不向局域网或互联网传输 CSV');
+status('本地访问', true, `仅监听本机 127.0.0.1；默认从 http://127.0.0.1:${process.env.PORT || 8787} 开始查找可用端口，不向局域网或互联网传输 CSV`);
 
 if (nodeMajor < requiredNodeMajor) process.exitCode = 1;
