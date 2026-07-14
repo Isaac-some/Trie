@@ -70,7 +70,7 @@ async function waitForJob(baseUrl, jobId) {
 test('exports a source/destination CSV and preserves the session for download', async (t) => {
   const server = await startServer();
   t.after(() => server.stop());
-  const csv = Buffer.from('rowkey,path\noriginal-row-key-001,tos://1/2/3/file.jpg\n');
+  const csv = Buffer.from('rowkey,path\noriginal-row-key-001,tos://1/2/3/4/5/file.jpg\n');
   const initResponse = await request(server.baseUrl, '/api/uploads/init', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -93,23 +93,34 @@ test('exports a source/destination CSV and preserves the session for download', 
   assert.equal(tree.children[0].autoBranch[0].name, '2');
   assert.equal(tree.children[0].autoBranch[0].autoBranch[0].name, '3');
 
+  const previewResponse = await request(server.baseUrl, `/api/datasets/${datasetId}/previews`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mappings: [{ source: 'tos://1/2/3/4/', destination: 'tos://6/7/8/' }] }),
+  });
+  assert.equal(previewResponse.status, 200);
+  assert.deepEqual((await previewResponse.json()).previews, [{
+    source: 'tos://1/2/3/4/5/file.jpg',
+    destination: 'tos://6/7/8/4/5/file.jpg',
+  }]);
+
   const duplicateResponse = await request(server.baseUrl, '/api/exports', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ entries: [{ datasetId, mappings: [
-      { source: 'tos://1/2/3/', destination: 'cos://5/' },
-      { source: 'tos://1/2/3/', destination: 'cos://6/' },
+      { source: 'tos://1/2/3/4/', destination: 'cos://5/' },
+      { source: 'tos://1/2/3/4/', destination: 'cos://6/' },
     ] }] }),
   });
   assert.equal(duplicateResponse.status, 400);
 
   const exportJob = await json(server.baseUrl, '/api/exports', {
-    entries: [{ datasetId, mappings: [{ source: 'tos://1/2/3/', destination: 'cos://5/' }] }],
+    entries: [{ datasetId, mappings: [{ source: 'tos://1/2/3/4/', destination: 'tos://6/7/8/' }] }],
   });
   await waitForJob(server.baseUrl, exportJob.jobId);
   const download = await request(server.baseUrl, `/api/exports/${exportJob.exportId}/download`);
   assert.equal(download.status, 200);
-  assert.equal(await download.text(), 'src_path,dst_path,rowkey\ntos://1/2/3/file.jpg,cos://5/file.jpg,original-row-key-001\n');
+  assert.equal(await download.text(), 'src_path,dst_path,rowkey\ntos://1/2/3/4/5/file.jpg,tos://6/7/8/4/5/file.jpg,original-row-key-001\n');
 
   const deleteResponse = await request(server.baseUrl, `/api/datasets/${datasetId}`, { method: 'DELETE' });
   assert.equal(deleteResponse.status, 200);

@@ -37,6 +37,13 @@ function now() { return new Date().toISOString(); }
 function id() { return randomUUID(); }
 function normalizeTarget(value) { const trimmed = String(value || '').trim(); return trimmed && !trimmed.endsWith('/') ? `${trimmed}/` : trimmed; }
 function normalizeSource(value) { const trimmed = String(value || '').trim(); return trimmed && !trimmed.endsWith('/') ? `${trimmed}/` : trimmed; }
+function parentPrefix(source) {
+  const withoutTrailingSlash = source.replace(/\/+$/, '');
+  return source.slice(0, withoutTrailingSlash.lastIndexOf('/') + 1);
+}
+function mappedDestination(sourcePath, mapping) {
+  return `${mapping.destination}${sourcePath.slice(parentPrefix(mapping.source).length)}`;
+}
 function rowKeyIndex(dataset) { return dataset.columns.find((column) => String(column.name).trim().toLowerCase() === 'rowkey')?.index ?? -1; }
 function normalizeMappings(rawMappings) {
   const mappingsBySource = new Map();
@@ -284,6 +291,28 @@ async function exportDataset(datasetId, exportId, jobId, mappings) {
   return exportDatasets([{ datasetId, mappings }], exportId, jobId);
 }
 
+async function mappingPreviews(dataset, mappings, limit = 5) {
+  const previews = [];
+  const seen = new Set();
+  let firstRow = true;
+  for await (const record of csvRecords(dataset.filePath)) {
+    if (firstRow) { firstRow = false; continue; }
+    for (const column of dataset.selectedColumns) {
+      for (const source of extractTosPaths(record[column] || '')) {
+        for (const mapping of mappings) {
+          if (!source.startsWith(mapping.source)) continue;
+          const destination = mappedDestination(source, mapping);
+          const key = `${source}\n${destination}`;
+          if (!seen.has(key)) previews.push({ source, destination });
+          seen.add(key);
+          if (previews.length >= limit) return previews;
+        }
+      }
+    }
+  }
+  return previews;
+}
+
 async function exportDatasets(entries, exportId, jobId) {
   if (activeJobs.has(jobId)) return;
   activeJobs.add(jobId);
@@ -310,7 +339,7 @@ async function exportDatasets(entries, exportId, jobId) {
           for (const sourcePath of extractTosPaths(record[column] || '')) {
             for (const mapping of entry.mappings) {
               if (!sourcePath.startsWith(mapping.source)) continue;
-              const destination = `${mapping.destination}${sourcePath.slice(mapping.source.length)}`;
+              const destination = mappedDestination(sourcePath, mapping);
               if (!output.write(`${csvCell(sourcePath)},${csvCell(destination)},${csvCell(record[sourceRowKeyIndex] || '')}\n`)) await new Promise((resolve) => output.once('drain', resolve));
               rows++;
             }
@@ -461,6 +490,12 @@ async function handleApi(request, response, url) {
     if (request.method === 'DELETE' && parts.length === 3) {
       await removeDataset(sessionId, dataset);
       return json(response, 200, { ok: true });
+    }
+    if (request.method === 'POST' && parts[3] === 'previews') {
+      const body = await readJson(request);
+      const normalized = normalizeMappings(body.mappings);
+      if (normalized.error) return json(response, 400, { error: normalized.error });
+      return json(response, 200, { previews: await mappingPreviews(dataset, normalized.mappings) });
     }
     if (request.method === 'POST' && parts[3] === 'process') {
       const body = await readJson(request);
