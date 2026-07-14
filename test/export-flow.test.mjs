@@ -102,6 +102,8 @@ test('exports a source/destination CSV and preserves the session for download', 
   assert.deepEqual((await previewResponse.json()).previews, [{
     source: 'tos://1/2/3/4/5/file.jpg',
     destination: 'tos://6/7/8/4/5/file.jpg',
+    sourcePrefix: 'tos://1/2/3/',
+    destinationPrefix: 'tos://6/7/8/',
   }]);
 
   const duplicateResponse = await request(server.baseUrl, '/api/exports', {

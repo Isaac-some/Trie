@@ -303,7 +303,12 @@ async function mappingPreviews(dataset, mappings, limit = 5) {
           if (!source.startsWith(mapping.source)) continue;
           const destination = mappedDestination(source, mapping);
           const key = `${source}\n${destination}`;
-          if (!seen.has(key)) previews.push({ source, destination });
+          if (!seen.has(key)) previews.push({
+            source,
+            destination,
+            sourcePrefix: parentPrefix(mapping.source),
+            destinationPrefix: mapping.destination,
+          });
           seen.add(key);
           if (previews.length >= limit) return previews;
         }
